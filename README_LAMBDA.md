@@ -6,7 +6,8 @@ Telegram bot that creates rating polls, deployed on AWS Lambda.
 
 - **AWS Lambda**: Runs the bot code (3 functions: `webhook`, `notifySignup`, `notifyFeedback`)
 - **API Gateway (HTTP API v2)**: Receives the webhook from Telegram
-- **SSM Parameter Store**: Stores the bot token + admin chat ID securely
+- **SSM Parameter Store**: Stores the bot token securely (see [Data Model](#data-model)
+  for exactly which parameters exist and which are actually read at runtime)
 - **Terraform** — two fully independent, symmetric stacks, one per environment:
   `aws_infra/lambda/ttrpg_poll_bot_dev` and `aws_infra/lambda/ttrpg_poll_bot_prod`. Each
   owns its own functions, its own API Gateway (own webhook URL, own registered Telegram
@@ -98,7 +99,7 @@ aws lambda update-function-code --function-name telegram-poll-bot-<env>-notifyFe
 - `/poll <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
 - `/rate <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
 - `/bool <question>` - Create a Yes/No poll
-- `/stats` - Open the club's Telegram Mini App to see your own rating stats and game history
+- `/stats` - Open the club's Telegram Mini App: your own rating stats, game history, and a leaderboard
 - `/start` - Show help
 
 ## Configuration
@@ -121,6 +122,13 @@ python main.py
 ```bash
 aws logs tail /aws/lambda/telegram-poll-bot-prod-webhook --follow
 ```
+
+**Prod also alerts to Telegram automatically** — the 3 prod functions log structured
+JSON (`logging_log_format = "JSON"` in Terraform) so every `ERROR`-level line has a
+reliable `level` field; a CloudWatch Logs subscription filter forwards those straight to
+a small Lambda that DMs the admin chat, reusing this bot's own token
+(`aws_infra/monitoring/ttrpg_club_prod_alerts`). Dev deliberately isn't wired up to
+this — active development produces expected errors that aren't actionable alerts.
 
 ## Cleanup
 
@@ -149,6 +157,39 @@ Mini App (stats/feedback pages), apply `aws_infra/s3_cloudfront/ttrpg_club_front
 Routine code pushes update both bots' functions together in one CI run (see the GitHub
 Actions section below, and the manual command list under "Routine code changes" above)
 — since the code is identical, there's no separate per-environment build/deploy step.
+
+## Data Model
+
+All tables live in `aws_infra/dynamodb/ttrpg_club/<env>` (one Terraform state, all 11
+of that project's tables — see `../ttrpg_website2/README.md` for the other 8, which
+this bot never touches). Point-in-time recovery is enabled on all prod tables — see
+`aws_infra/dynamodb/ttrpg_club/prod`.
+
+| Table | Key | Written by | Read by | Purpose |
+|---|---|---|---|---|
+| `telegram_rating_polls` | `pollId` (+ `creatorUserId-index` GSI) | This bot (`handle_poll_command`) | This bot, website's Mini App API | One row per `/rate` poll — question text, GM (`creatorUserId`, captured from the command's sender). |
+| `telegram_rating_votes` | `pollId` + `telegramUserId` (+ `telegramUserId-index` GSI) | This bot (`handle_poll_answer`) | Website's Mini App API | One row per person's current rating on a poll. The row's existence *is* the vote — a retraction or switch to "view results" **deletes** the row rather than storing a null rating. |
+| `telegram_feedback` | `pollId` + `feedbackId` | Website's Mini App (`POST /telegram/feedback`) | This bot (`notify_new_feedback`, via a DynamoDB Stream) | Detailed per-session feedback submitted through the Mini App form — this bot only reads it (to DM the GM), never writes it. |
+| `signup_requests` *(website-owned)* | `requestId` | Website backend | This bot (`notify_new_signup`, via a DynamoDB Stream) | Not one of this bot's own tables — `notifySignup` just consumes its Stream to DM the admin about new club applications. |
+
+Two SSM parameters per environment, Terraform-managed placeholders (`aws_ssm_parameter`
+with `value = "replace_me!"` and `ignore_changes` on value, so Terraform never
+overwrites what you actually set — see Setup above):
+`/ttrpg_club/<env>/poll_bot/token` (the real, in-use bot token) and
+`/ttrpg_club/<env>/telegram_admin_chat_id` (currently unused by any code — the real
+admin chat ID is wired directly as the `admin_chat_id` Terraform variable instead; this
+parameter is reserved for if that ever needs to move to SSM).
+
+## Backfilling Historical Data
+
+If the bot was running (creating `/rate` polls) before DynamoDB tracking existed,
+`scripts/backfill_historical_polls.py` can recover that history straight from Telegram:
+it logs in as a personal account (MTProto — the Bot API has no method to read chat
+history at all) and walks the chat, matching each poll back to the `/rate` command that
+created it and fetching every voter. See the script's own docstring for the full
+`check` → `scan` → `load` workflow, safety notes (it's read/inspect-before-you-write
+throughout), and why it sometimes needs to cast a real "Подивитись відповідь" vote to
+unlock a poll's results (harmless — the live bot treats that option as "not a rating").
 
 ## Club Signup Notifications (`notifySignup`)
 
@@ -217,6 +258,14 @@ into a per-session voter breakdown. These read from the same two tables above (p
 `creatorUserId-index` GSI on the polls table for "conducted") via new `POST
 /telegram/games/*` endpoints on the club API — no bot changes needed for this part.
 
+A fourth button, **🏆 Leaderboard**, shows two top-10 lists — most games played, most
+games run as GM — with standard competition ranking (ties share a place; e.g. two
+people tied for 1st are both shown 🥇, the next distinct score is 3rd, never 2nd), gold/
+silver/bronze medals for the top 3, and a default filter of "this month" (with buttons
+for last month, all time, or a custom range). Backed by `POST /telegram/leaderboard`.
+One deliberate exclusion: a GM's own vote on their own session doesn't count as them
+"playing" it — only counted on the GM board, not the player board.
+
 ## Session Feedback (`?startapp=feedback_<pollId>`)
 
 Alongside the quick 1-10 poll, every `/rate` also sends a second message with a
@@ -282,4 +331,10 @@ AWS Lambda free tier includes:
 - 1M requests/month
 - 400,000 GB-seconds of compute time/month
 
-This bot should stay within free tier for moderate usage.
+This bot should stay within free tier for moderate usage. Two small additions beyond
+Lambda itself, both negligible at this project's table sizes: point-in-time recovery on
+the prod DynamoDB tables (~$0.20/GB-month) and the error-alerting Lambda in
+`aws_infra/monitoring/ttrpg_club_prod_alerts`, which costs nothing beyond its own
+(effectively free-tier) invocations — it's a plain CloudWatch Logs subscription filter,
+deliberately not a CloudWatch Alarm + SNS setup, since alarms bill a flat monthly fee
+per alarm whether or not they ever fire.

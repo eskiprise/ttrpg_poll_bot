@@ -18,6 +18,12 @@ Three phases, run in order — each is safe to inspect before moving to the next
   2. scan   — walks the whole chat history, finds every /rate-created poll, fetches its
               voters, and writes everything to a local JSON file. Touches Telegram only,
               never AWS. Prints a summary including anything it couldn't resolve.
+              Telegram hides a non-anonymous poll's results from you until you've voted
+              in it yourself — by default this auto-casts "Подивитись відповідь" on any
+              poll that needs it to unlock results (harmless: the live bot treats that
+              option as "not a rating" and doesn't count it — see handle_poll_answer).
+              Pass --no-vote-to-unlock to skip-and-report those polls instead, like the
+              old behavior.
   3. load   — reads that JSON and writes to DynamoDB. Idempotent: skips any poll/vote
               that's already in the table (never overwrites live data), and defaults to
               --dry-run so you see exactly what would be written first.
@@ -81,6 +87,18 @@ def _rating_poll_shape(answers) -> dict | None:
         seen.add(n)
         mapping[a.option] = n
     return mapping if len(seen) == 10 else None
+
+
+def _view_results_option(answers, rating_by_bytes: dict) -> bytes | None:
+    """
+    The one answer option that ISN'T a rating — "Подивитись відповідь" — found by
+    exclusion (whatever's left after the 10 "N / 10" options) rather than assumed to be
+    answers[0], since _rating_poll_shape() already deliberately doesn't rely on option
+    order. None if the shape isn't what's expected (shouldn't happen for anything that
+    already passed _rating_poll_shape, but this is called separately).
+    """
+    others = [a.option for a in answers if a.option not in rating_by_bytes]
+    return others[0] if len(others) == 1 else None
 
 
 def _expected_question(args: str) -> str:
@@ -190,7 +208,7 @@ def cmd_check(args):
 def cmd_scan(args):
     client = _get_client(args.session)
     from telethon.tl.types import MessageMediaPoll, MessagePeerVote, MessagePeerVoteMultiple, PeerUser
-    from telethon.tl.functions.messages import GetPollVotesRequest
+    from telethon.tl.functions.messages import GetPollVotesRequest, SendVoteRequest
     from telethon.errors import PollVoteRequiredError, FloodWaitError
     import time
 
@@ -201,7 +219,8 @@ def cmd_scan(args):
     command_candidates = []  # [{message_id, date, sender, expected_question}]
     polls = []               # [{pollId, questionText, chatId, createdAt, creator*, messageThreadId}]
     votes = []                # [{pollId, telegramUserId, username, firstName, lastName, rating, questionText, answeredAt}]
-    blocked_polls = []        # polls where votes couldn't be fetched (POLL_VOTE_REQUIRED)
+    blocked_polls = []        # polls where votes still couldn't be fetched after an auto-vote attempt (or auto-vote is off)
+    unlocked_polls = []       # polls where "Подивитись відповідь" was auto-voted to reveal results
     unmatched_creator = []    # polls where no preceding /rate command matched
 
     scanned = 0
@@ -278,10 +297,35 @@ def cmd_scan(args):
 
         offset = ""
         poll_blocked = False
+        voted_to_unlock = False
         while True:
             try:
                 result = client(GetPollVotesRequest(peer=chat, id=message.id, offset=offset, limit=50))
             except PollVoteRequiredError:
+                # Telegram hides a non-anonymous poll's results from you until you've
+                # cast a vote in it yourself. "Подивитись відповідь" is built for
+                # exactly this: the live bot's poll_answer handler treats option 0 as
+                # "not a real rating" and clears any vote rather than recording one
+                # (see lambda_handler.py's handle_poll_answer), so this can't pollute
+                # anyone's stats. It DOES cast a real, live vote though — if this poll
+                # is still open (the bot never closes them), that fires an actual
+                # poll_answer webhook to whichever bot owns it, right now.
+                if args.vote_to_unlock and not voted_to_unlock:
+                    view_results_option = _view_results_option(answers, option_rating_by_bytes)
+                    if view_results_option is None:
+                        blocked_polls.append({"pollId": poll_row["pollId"], "question": question, "date": poll_row["createdAt"], "reason": "couldn't identify the 'view results' option"})
+                        poll_blocked = True
+                        break
+                    try:
+                        client(SendVoteRequest(peer=chat, msg_id=message.id, options=[view_results_option]))
+                    except Exception as vote_err:
+                        blocked_polls.append({"pollId": poll_row["pollId"], "question": question, "date": poll_row["createdAt"], "reason": f"auto-vote failed: {vote_err}"})
+                        poll_blocked = True
+                        break
+                    voted_to_unlock = True
+                    unlocked_polls.append({"pollId": poll_row["pollId"], "question": question, "date": poll_row["createdAt"]})
+                    time.sleep(0.5)  # let the vote propagate before asking for results again
+                    continue
                 blocked_polls.append({"pollId": poll_row["pollId"], "question": question, "date": poll_row["createdAt"]})
                 poll_blocked = True
                 break
@@ -319,7 +363,8 @@ def cmd_scan(args):
             offset = result.next_offset
 
         if not poll_blocked:
-            print(f"  poll {poll_row['pollId']} ({question}): {sum(1 for v in votes if v['pollId'] == poll_row['pollId'])} votes", file=sys.stderr)
+            unlocked_note = " [auto-voted to unlock]" if voted_to_unlock else ""
+            print(f"  poll {poll_row['pollId']} ({question}): {sum(1 for v in votes if v['pollId'] == poll_row['pollId'])} votes{unlocked_note}", file=sys.stderr)
 
     out = {
         "chat": args.chat,
@@ -327,6 +372,7 @@ def cmd_scan(args):
         "polls": polls,
         "votes": votes,
         "blocked_polls": blocked_polls,
+        "unlocked_polls": unlocked_polls,
         "unmatched_creator": unmatched_creator,
     }
     with open(args.out, "w") as f:
@@ -335,14 +381,19 @@ def cmd_scan(args):
     print()
     print(f"Scanned {scanned} messages.")
     print(f"Found {len(polls)} rating polls, {len(votes)} votes.")
-    if blocked_polls:
-        print(f"\n{len(blocked_polls)} poll(s) skipped — POLL_VOTE_REQUIRED (you must vote in a poll")
-        print("before Telegram will show you its results). To include these, vote in each one")
-        print("in the Telegram app, then re-run scan with --since covering just those dates and")
-        print("merge the results — voting now will also fire a live poll_answer webhook to the")
-        print("bot, so expect a real row to appear in the current tables for your own vote:")
-        for p in blocked_polls:
+    if unlocked_polls:
+        print(f"\n{len(unlocked_polls)} poll(s) required voting 'Подивитись відповідь' to reveal results —")
+        print("done automatically. This cast a real vote on each (harmless: the live bot treats")
+        print("that option as 'not a rating' and doesn't count it), and fired a live poll_answer")
+        print("webhook to whichever bot owns each poll, right now, for any that are still open:")
+        for p in unlocked_polls:
             print(f"  - {p['date']}  {p['question']}  (pollId {p['pollId']})")
+    if blocked_polls:
+        reason = "auto-vote-to-unlock is off (--no-vote-to-unlock)" if not args.vote_to_unlock else "even after voting to unlock — see each row's 'reason'"
+        print(f"\n{len(blocked_polls)} poll(s) still skipped — {reason}:")
+        for p in blocked_polls:
+            extra = f"  ({p['reason']})" if p.get("reason") else ""
+            print(f"  - {p['date']}  {p['question']}  (pollId {p['pollId']}){extra}")
     if unmatched_creator:
         print(f"\n{len(unmatched_creator)} poll(s) had no matching /rate command before them")
         print("(creatorUserId will be null — edit the JSON by hand if you know who ran these):")
@@ -444,6 +495,14 @@ def main():
     p_scan.add_argument("--out", required=True)
     p_scan.add_argument("--since", help="YYYY-MM-DD, inclusive")
     p_scan.add_argument("--until", help="YYYY-MM-DD, inclusive")
+    p_scan.add_argument(
+        "--no-vote-to-unlock",
+        dest="vote_to_unlock",
+        action="store_false",
+        default=True,
+        help="Don't auto-vote 'Подивитись відповідь' on polls that need a vote to reveal "
+        "results — just skip them and report, like before (default: auto-vote)",
+    )
     p_scan.set_defaults(func=cmd_scan)
 
     p_load = sub.add_parser("load", help="Write a scanned JSON export into DynamoDB (idempotent)")
