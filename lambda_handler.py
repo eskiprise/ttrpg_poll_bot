@@ -158,21 +158,6 @@ class Bot:
             logger.error(f"Failed to get SSM parameter {parameter_name}: {e}")
             raise
 
-
-_ssm_parameter_cache: dict = {}
-
-
-def _get_ssm_parameter(parameter_name: str) -> str:
-    """Fetch and cache an SSM parameter value for the lifetime of this warm container —
-    unlike Bot._get_token_from_ssm (called fresh per Bot()), this backs chat IDs that get
-    read on nearly every invocation (e.g. update_handler's chat-restriction check), so an
-    uncached fetch would mean an SSM call per webhook request."""
-    if parameter_name not in _ssm_parameter_cache:
-        ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'eu-west-2'))
-        response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
-        _ssm_parameter_cache[parameter_name] = response['Parameter']['Value']
-    return _ssm_parameter_cache[parameter_name]
-
     def send_message(
         self,
         chat_id: int,
@@ -232,6 +217,21 @@ def _get_ssm_parameter(parameter_name: str) -> str:
         logger.debug(f'{response.status_code=} {response.text=}')
 
         return response.status_code
+
+
+_ssm_parameter_cache: dict = {}
+
+
+def _get_ssm_parameter(parameter_name: str) -> str:
+    """Fetch and cache an SSM parameter value for the lifetime of this warm container —
+    unlike Bot._get_token_from_ssm (called fresh per Bot()), this backs chat IDs that get
+    read on nearly every invocation (e.g. update_handler's chat-restriction check), so an
+    uncached fetch would mean an SSM call per webhook request."""
+    if parameter_name not in _ssm_parameter_cache:
+        ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'eu-west-2'))
+        response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+        _ssm_parameter_cache[parameter_name] = response['Parameter']['Value']
+    return _ssm_parameter_cache[parameter_name]
 
 
 _dynamodb = boto3.resource('dynamodb', region_name=os.environ.get('AWS_REGION', 'eu-west-2'))
