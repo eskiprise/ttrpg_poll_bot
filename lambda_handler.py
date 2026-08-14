@@ -104,12 +104,28 @@ class PollAnswer:
         return str(self.__dict__)
 
 
+class ChatMemberUpdated:
+    """The bot's own membership in a chat changed — added, removed, promoted, etc.
+    For private chats this only fires on block/unblock (see Telegram's docs), never a
+    real "join" — callers must check chat.type before treating this as a group-add."""
+    def __init__(self, data: dict) -> None:
+        self.chat = Chat(data.get('chat', {}))
+        self.old_status: str = data.get('old_chat_member', {}).get('status', '')
+        self.new_status: str = data.get('new_chat_member', {}).get('status', '')
+
+    def __repr__(self) -> str:
+        return str(self.__dict__)
+
+
 class Update:
     def __init__(self, update: dict) -> None:
         self.update_id = update.get('update_id')
         self.message = Message(update.get('message', {})) if 'message' in update else None
         self.poll_answer = (
             PollAnswer(update.get('poll_answer', {})) if 'poll_answer' in update else None
+        )
+        self.my_chat_member = (
+            ChatMemberUpdated(update['my_chat_member']) if 'my_chat_member' in update else None
         )
 
     def __repr__(self) -> str:
@@ -132,7 +148,7 @@ class Bot:
         """Fetch bot token from SSM Parameter Store."""
         ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'eu-west-2'))
         parameter_name = os.environ.get('TELEGRAM_TOKEN_SSM_PARAMETER', '/telegram/poll_bot/token')
-        
+
         try:
             response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
             token = response['Parameter']['Value']
@@ -141,6 +157,21 @@ class Bot:
         except Exception as e:
             logger.error(f"Failed to get SSM parameter {parameter_name}: {e}")
             raise
+
+
+_ssm_parameter_cache: dict = {}
+
+
+def _get_ssm_parameter(parameter_name: str) -> str:
+    """Fetch and cache an SSM parameter value for the lifetime of this warm container —
+    unlike Bot._get_token_from_ssm (called fresh per Bot()), this backs chat IDs that get
+    read on nearly every invocation (e.g. update_handler's chat-restriction check), so an
+    uncached fetch would mean an SSM call per webhook request."""
+    if parameter_name not in _ssm_parameter_cache:
+        ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'eu-west-2'))
+        response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+        _ssm_parameter_cache[parameter_name] = response['Parameter']['Value']
+    return _ssm_parameter_cache[parameter_name]
 
     def send_message(
         self,
@@ -193,6 +224,15 @@ class Bot:
 
         return response.json()
 
+    def leave_chat(self, chat_id: int) -> int:
+        """Remove the bot from a chat — used to eject itself from unauthorized groups."""
+        url = self.api_url + 'leaveChat'
+        response = self.session.post(url=url, json={'chat_id': chat_id})
+        logger.info(f'Left chat {chat_id}')
+        logger.debug(f'{response.status_code=} {response.text=}')
+
+        return response.status_code
+
 
 _dynamodb = boto3.resource('dynamodb', region_name=os.environ.get('AWS_REGION', 'eu-west-2'))
 
@@ -224,7 +264,7 @@ def notify_new_signup(event, context):
     newly-inserted pending signup request, reusing this bot's existing token/session.
     """
     bot = Bot()
-    admin_chat_id = os.environ['ADMIN_CHAT_ID']
+    admin_chat_id = _get_ssm_parameter(os.environ['ADMIN_CHAT_ID_SSM_PARAMETER'])
     records = event.get('Records', [])
     logger.info(f"notify_new_signup received {len(records)} stream record(s)")
 
@@ -532,21 +572,75 @@ def handle_poll_answer(update: Update):
     logger.info(f"Recorded rating {rating} from user {answer.user.id} for poll {answer.poll_id}")
 
 
+GROUP_CHAT_TYPES = ('group', 'supergroup')
+
+
+def _allowed_chat_id() -> int:
+    return int(_get_ssm_parameter(os.environ['ALLOWED_CHAT_ID_SSM_PARAMETER']))
+
+
+def _reject_unauthorized_chat(bot: Bot, chat_id: int, message_thread_id: int = None) -> None:
+    """Tell whoever added the bot to a group it doesn't belong in, then leave. Never
+    call this for a private chat — leaveChat isn't a meaningful operation on a DM, and
+    my_chat_member fires there too (on block/unblock), which this must not react to."""
+    bot_username = os.environ.get('BOT_USERNAME', '')
+    text = (
+        "Привіт! Цей бот працює лише в чаті нашого TTRPG клубу.\n"
+        f"Щоб дізнатись більше, напишіть мені особисто: @{bot_username}."
+    )
+    bot.send_message(chat_id, text, message_thread_id=message_thread_id)
+    bot.leave_chat(chat_id)
+    logger.warning(f"Left unauthorized chat {chat_id}")
+
+
+def _handle_my_chat_member(update: Update) -> None:
+    """React to the bot's own membership changing in a chat. Only acts on "freshly
+    added to a group/supergroup" — ignores private-chat block/unblock events (which
+    also arrive as my_chat_member) and ignores removals/promotions in an already-known
+    chat, since those aren't "somebody just added me somewhere new"."""
+    member_update = update.my_chat_member
+    chat = member_update.chat
+    if chat.type not in GROUP_CHAT_TYPES:
+        return
+
+    was_member = member_update.old_status in ('member', 'administrator', 'creator')
+    is_member_now = member_update.new_status in ('member', 'administrator')
+    if was_member or not is_member_now:
+        return
+
+    if chat.id == _allowed_chat_id():
+        logger.info(f"Bot added to the allowed chat {chat.id}")
+        return
+
+    _reject_unauthorized_chat(Bot(), chat.id)
+
+
 def update_handler(update: Update):
     """Process incoming update."""
     if update.poll_answer:
         handle_poll_answer(update)
         return
 
+    if update.my_chat_member:
+        _handle_my_chat_member(update)
+        return
+
     if not update.message:
-        logger.warning("Update without message or poll_answer received")
+        logger.warning("Update without message, poll_answer, or my_chat_member received")
+        return
+
+    chat = update.message.chat
+    if chat.type in GROUP_CHAT_TYPES and chat.id != _allowed_chat_id():
+        # Belt-and-suspenders for a chat the bot was already in before this restriction
+        # existed, or where leaveChat above didn't take effect for some reason.
+        _reject_unauthorized_chat(Bot(), chat.id, update.message.message_thread_id)
         return
 
     bot = Bot()
     command = update.message.get_command()
-    
+
     logger.info(f"Received command: {command} from user {update.message.from_user.username}")
-    
+
     if command == '/start':
         handle_start_command(bot, update)
     elif command in ['/poll', '/rate']:

@@ -43,25 +43,32 @@ Pick an environment directory: `aws_infra/lambda/ttrpg_poll_bot_dev` or
 cd ../../../ttrpg_poll_bot && ./build.sh   # produces build/, which Terraform's source_path reads
 cd -   # back in aws_infra/lambda/ttrpg_poll_bot_<env>
 terraform init
-terraform apply -var="admin_chat_id=<your numeric chat id>"
+terraform apply
 ```
 
-This also creates two Terraform-managed SSM placeholders (`/ttrpg_club/<env>/poll_bot/token`
-and `/ttrpg_club/<env>/telegram_admin_chat_id`, value `"replace_me!"` until you set them
-— Terraform ignores further changes to their value, so it won't clobber the real one).
+This also creates three Terraform-managed SSM placeholders (`/ttrpg_club/<env>/poll_bot/token`,
+`/ttrpg_club/<env>/telegram_admin_chat_id`, `/ttrpg_club/<env>/telegram_club_chat_id` —
+value `"replace_me!"` until you set them below; Terraform ignores further changes to
+their value, so it won't clobber the real one once set).
 
 (`ttrpg_poll_bot_prod/import-from-serverless.sh` is only relevant if you're migrating an
 existing Serverless Framework deployment from scratch rather than starting fresh.)
 
-### 2. Store the Real Bot Token in SSM
+### 2. Store the Real Values in SSM
+
+None of these are in source control — the bot token, the admin's personal chat ID (for
+signup notifications), and the club chat ID (see Chat Restriction below) are all set
+directly against SSM:
 
 ```bash
-aws ssm put-parameter \
-  --name "/ttrpg_club/<env>/poll_bot/token" \
-  --value "YOUR_BOT_TOKEN" \
-  --type "SecureString" \
-  --overwrite \
-  --region eu-west-2
+aws ssm put-parameter --name "/ttrpg_club/<env>/poll_bot/token" \
+  --value "YOUR_BOT_TOKEN" --type SecureString --overwrite --region eu-west-2
+
+aws ssm put-parameter --name "/ttrpg_club/<env>/telegram_admin_chat_id" \
+  --value "<admin's numeric chat id>" --type SecureString --overwrite --region eu-west-2
+
+aws ssm put-parameter --name "/ttrpg_club/<env>/telegram_club_chat_id" \
+  --value "<club group's numeric chat id>" --type SecureString --overwrite --region eu-west-2
 ```
 
 `terraform output webhook_url` gives you the API Gateway URL.
@@ -102,11 +109,35 @@ aws lambda update-function-code --function-name telegram-poll-bot-<env>-notifyFe
 - `/stats` - Open the club's Telegram Mini App: your own rating stats, game history, and a leaderboard
 - `/start` - Show help
 
+## Chat Restriction
+
+Each bot (dev and prod) is locked to exactly one Telegram group — the numeric ID stored
+in SSM at `/ttrpg_club/<env>/telegram_club_chat_id` (read at runtime via
+`ALLOWED_CHAT_ID_SSM_PARAMETER`, cached per warm container). If it's added to any other
+group/supergroup, or receives a command in one it was already sitting in, it replies
+with a short message pointing at its own `@<bot_username>` for DMs, then calls
+`leaveChat` on itself (`_reject_unauthorized_chat` in `lambda_handler.py`). This only
+ever fires for groups/supergroups — private chats with the bot are never restricted,
+since the rejection message's whole point is to send people to a DM. The join-time check
+uses the `my_chat_member` webhook update (Telegram's default `allowed_updates` already
+includes it, no webhook re-registration needed); note this same update type also fires
+for private chats on block/unblock, which is why the handler gates on `chat.type` first.
+
+Set the real value once, per environment (Terraform creates the parameter as a
+`replace_me!` placeholder and ignores changes to its value):
+```bash
+aws ssm put-parameter --name "/ttrpg_club/<env>/telegram_club_chat_id" \
+  --value "<numeric_chat_id>" --type SecureString --overwrite
+```
+
 ## Configuration
 
-Edit `aws_infra/lambda/ttrpg_poll_bot_<env>/variables.tf` (region, `admin_chat_id`,
-`mini_app_deep_link`) or `main.tf` (memory, timeout, environment variables) — these now
-live in Terraform, not `serverless.yml` (removed as part of the Terraform migration).
+Edit `aws_infra/lambda/ttrpg_poll_bot_<env>/variables.tf` (region, `mini_app_deep_link`,
+`bot_username`) or `main.tf` (memory, timeout, environment variables) — these now live in
+Terraform, not `serverless.yml` (removed as part of the Terraform migration). The two
+chat IDs (`admin_chat_id`, `allowed_chat_id`) aren't Terraform variables — they're kept
+out of source control entirely and read from SSM at runtime (see Chat Restriction above
+and the Setup section's SSM parameters).
 
 ## Local Development
 
@@ -140,6 +171,7 @@ Don't forget to delete that environment's SSM parameters:
 ```bash
 aws ssm delete-parameter --name "/ttrpg_club/<env>/poll_bot/token"
 aws ssm delete-parameter --name "/ttrpg_club/<env>/telegram_admin_chat_id"
+aws ssm delete-parameter --name "/ttrpg_club/<env>/telegram_club_chat_id"
 ```
 
 ## Dev vs Prod (two independent bots)
@@ -172,13 +204,14 @@ this bot never touches). Point-in-time recovery is enabled on all prod tables �
 | `telegram_feedback` | `pollId` + `feedbackId` | Website's Mini App (`POST /telegram/feedback`) | This bot (`notify_new_feedback`, via a DynamoDB Stream) | Detailed per-session feedback submitted through the Mini App form — this bot only reads it (to DM the GM), never writes it. |
 | `signup_requests` *(website-owned)* | `requestId` | Website backend | This bot (`notify_new_signup`, via a DynamoDB Stream) | Not one of this bot's own tables — `notifySignup` just consumes its Stream to DM the admin about new club applications. |
 
-Two SSM parameters per environment, Terraform-managed placeholders (`aws_ssm_parameter`
+Three SSM parameters per environment, Terraform-managed placeholders (`aws_ssm_parameter`
 with `value = "replace_me!"` and `ignore_changes` on value, so Terraform never
-overwrites what you actually set — see Setup above):
-`/ttrpg_club/<env>/poll_bot/token` (the real, in-use bot token) and
-`/ttrpg_club/<env>/telegram_admin_chat_id` (currently unused by any code — the real
-admin chat ID is wired directly as the `admin_chat_id` Terraform variable instead; this
-parameter is reserved for if that ever needs to move to SSM).
+overwrites what you actually set — see Setup above): `/ttrpg_club/<env>/poll_bot/token`
+(the bot token), `/ttrpg_club/<env>/telegram_admin_chat_id` (the admin's personal chat,
+for signup notifications), and `/ttrpg_club/<env>/telegram_club_chat_id` (the one group
+this bot is allowed to operate in — see Chat Restriction below). None of the three are
+in source control; the Lambda reads each by name (`*_SSM_PARAMETER` env vars) and caches
+the value for the life of the warm container.
 
 ## Backfilling Historical Data
 
@@ -195,8 +228,9 @@ unlock a poll's results (harmless — the live bot treats that option as "not a 
 
 A second function, `notifySignup`, is triggered directly by the `ttrpg_club_signup_requests`
 DynamoDB Stream from the separate `ttrpg_website2`/`aws_infra` project — it posts a message
-to `ADMIN_CHAT_ID` whenever someone submits a new club membership request. It reuses this
-bot's existing token (same SSM parameter, `Bot.send_message`), so no second bot is needed.
+to the admin's chat (fetched from `/ttrpg_club/<env>/telegram_admin_chat_id` via SSM)
+whenever someone submits a new club membership request. It reuses this bot's existing
+token (same SSM parameter, `Bot.send_message`), so no second bot is needed.
 
 The stream ARN needs no manual wiring — `aws_infra`'s Terraform for that environment's
 `signup_requests` table publishes it to SSM as `/ttrpg_club/<env>/signup_requests_stream_arn`,
@@ -244,9 +278,7 @@ deep link, which works everywhere):
    deployed site's `/telegram` page — e.g. `https://your-cloudfront-domain/telegram`.
 2. Apply with the resulting deep link:
    ```bash
-   terraform apply \
-     -var="admin_chat_id=$ADMIN_CHAT_ID" \
-     -var="mini_app_deep_link=https://t.me/your_bot/stats"
+   terraform apply -var="mini_app_deep_link=https://t.me/your_bot/stats"
    ```
 
 Until `mini_app_deep_link` is set, `/stats` replies with a "temporarily unavailable"
