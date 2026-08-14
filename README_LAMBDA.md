@@ -6,7 +6,8 @@ Telegram bot that creates rating polls, deployed on AWS Lambda.
 
 - **AWS Lambda**: Runs the bot code (3 functions: `webhook`, `notifySignup`, `notifyFeedback`)
 - **API Gateway (HTTP API v2)**: Receives the webhook from Telegram
-- **SSM Parameter Store**: Stores the bot token + admin chat ID securely
+- **SSM Parameter Store**: Stores the bot token securely (see [Data Model](#data-model)
+  for exactly which parameters exist and which are actually read at runtime)
 - **Terraform** — two fully independent, symmetric stacks, one per environment:
   `aws_infra/lambda/ttrpg_poll_bot_dev` and `aws_infra/lambda/ttrpg_poll_bot_prod`. Each
   owns its own functions, its own API Gateway (own webhook URL, own registered Telegram
@@ -42,25 +43,32 @@ Pick an environment directory: `aws_infra/lambda/ttrpg_poll_bot_dev` or
 cd ../../../ttrpg_poll_bot && ./build.sh   # produces build/, which Terraform's source_path reads
 cd -   # back in aws_infra/lambda/ttrpg_poll_bot_<env>
 terraform init
-terraform apply -var="admin_chat_id=<your numeric chat id>"
+terraform apply
 ```
 
-This also creates two Terraform-managed SSM placeholders (`/ttrpg_club/<env>/poll_bot/token`
-and `/ttrpg_club/<env>/telegram_admin_chat_id`, value `"replace_me!"` until you set them
-— Terraform ignores further changes to their value, so it won't clobber the real one).
+This also creates three Terraform-managed SSM placeholders (`/ttrpg_club/<env>/poll_bot/token`,
+`/ttrpg_club/<env>/telegram_admin_chat_id`, `/ttrpg_club/<env>/telegram_club_chat_id` —
+value `"replace_me!"` until you set them below; Terraform ignores further changes to
+their value, so it won't clobber the real one once set).
 
 (`ttrpg_poll_bot_prod/import-from-serverless.sh` is only relevant if you're migrating an
 existing Serverless Framework deployment from scratch rather than starting fresh.)
 
-### 2. Store the Real Bot Token in SSM
+### 2. Store the Real Values in SSM
+
+None of these are in source control — the bot token, the admin's personal chat ID (for
+signup notifications), and the club chat ID (see Chat Restriction below) are all set
+directly against SSM:
 
 ```bash
-aws ssm put-parameter \
-  --name "/ttrpg_club/<env>/poll_bot/token" \
-  --value "YOUR_BOT_TOKEN" \
-  --type "SecureString" \
-  --overwrite \
-  --region eu-west-2
+aws ssm put-parameter --name "/ttrpg_club/<env>/poll_bot/token" \
+  --value "YOUR_BOT_TOKEN" --type SecureString --overwrite --region eu-west-2
+
+aws ssm put-parameter --name "/ttrpg_club/<env>/telegram_admin_chat_id" \
+  --value "<admin's numeric chat id>" --type SecureString --overwrite --region eu-west-2
+
+aws ssm put-parameter --name "/ttrpg_club/<env>/telegram_club_chat_id" \
+  --value "<club group's numeric chat id>" --type SecureString --overwrite --region eu-west-2
 ```
 
 `terraform output webhook_url` gives you the API Gateway URL.
@@ -98,14 +106,38 @@ aws lambda update-function-code --function-name telegram-poll-bot-<env>-notifyFe
 - `/poll <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
 - `/rate <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
 - `/bool <question>` - Create a Yes/No poll
-- `/stats` - Open the club's Telegram Mini App to see your own rating stats and game history
+- `/stats` - Open the club's Telegram Mini App: your own rating stats, game history, and a leaderboard
 - `/start` - Show help
+
+## Chat Restriction
+
+Each bot (dev and prod) is locked to exactly one Telegram group — the numeric ID stored
+in SSM at `/ttrpg_club/<env>/telegram_club_chat_id` (read at runtime via
+`ALLOWED_CHAT_ID_SSM_PARAMETER`, cached per warm container). If it's added to any other
+group/supergroup, or receives a command in one it was already sitting in, it replies
+with a short message pointing at its own `@<bot_username>` for DMs, then calls
+`leaveChat` on itself (`_reject_unauthorized_chat` in `lambda_handler.py`). This only
+ever fires for groups/supergroups — private chats with the bot are never restricted,
+since the rejection message's whole point is to send people to a DM. The join-time check
+uses the `my_chat_member` webhook update (Telegram's default `allowed_updates` already
+includes it, no webhook re-registration needed); note this same update type also fires
+for private chats on block/unblock, which is why the handler gates on `chat.type` first.
+
+Set the real value once, per environment (Terraform creates the parameter as a
+`replace_me!` placeholder and ignores changes to its value):
+```bash
+aws ssm put-parameter --name "/ttrpg_club/<env>/telegram_club_chat_id" \
+  --value "<numeric_chat_id>" --type SecureString --overwrite
+```
 
 ## Configuration
 
-Edit `aws_infra/lambda/ttrpg_poll_bot_<env>/variables.tf` (region, `admin_chat_id`,
-`mini_app_deep_link`) or `main.tf` (memory, timeout, environment variables) — these now
-live in Terraform, not `serverless.yml` (removed as part of the Terraform migration).
+Edit `aws_infra/lambda/ttrpg_poll_bot_<env>/variables.tf` (region, `mini_app_deep_link`,
+`bot_username`) or `main.tf` (memory, timeout, environment variables) — these now live in
+Terraform, not `serverless.yml` (removed as part of the Terraform migration). The two
+chat IDs (`admin_chat_id`, `allowed_chat_id`) aren't Terraform variables — they're kept
+out of source control entirely and read from SSM at runtime (see Chat Restriction above
+and the Setup section's SSM parameters).
 
 ## Local Development
 
@@ -122,6 +154,13 @@ python main.py
 aws logs tail /aws/lambda/telegram-poll-bot-prod-webhook --follow
 ```
 
+**Prod also alerts to Telegram automatically** — the 3 prod functions log structured
+JSON (`logging_log_format = "JSON"` in Terraform) so every `ERROR`-level line has a
+reliable `level` field; a CloudWatch Logs subscription filter forwards those straight to
+a small Lambda that DMs the admin chat, reusing this bot's own token
+(`aws_infra/monitoring/ttrpg_club_prod_alerts`). Dev deliberately isn't wired up to
+this — active development produces expected errors that aren't actionable alerts.
+
 ## Cleanup
 
 ```bash
@@ -132,6 +171,7 @@ Don't forget to delete that environment's SSM parameters:
 ```bash
 aws ssm delete-parameter --name "/ttrpg_club/<env>/poll_bot/token"
 aws ssm delete-parameter --name "/ttrpg_club/<env>/telegram_admin_chat_id"
+aws ssm delete-parameter --name "/ttrpg_club/<env>/telegram_club_chat_id"
 ```
 
 ## Dev vs Prod (two independent bots)
@@ -150,12 +190,47 @@ Routine code pushes update both bots' functions together in one CI run (see the 
 Actions section below, and the manual command list under "Routine code changes" above)
 — since the code is identical, there's no separate per-environment build/deploy step.
 
+## Data Model
+
+All tables live in `aws_infra/dynamodb/ttrpg_club/<env>` (one Terraform state, all 11
+of that project's tables — see `../ttrpg_website2/README.md` for the other 8, which
+this bot never touches). Point-in-time recovery is enabled on all prod tables — see
+`aws_infra/dynamodb/ttrpg_club/prod`.
+
+| Table | Key | Written by | Read by | Purpose |
+|---|---|---|---|---|
+| `telegram_rating_polls` | `pollId` (+ `creatorUserId-index` GSI) | This bot (`handle_poll_command`) | This bot, website's Mini App API | One row per `/rate` poll — question text, GM (`creatorUserId`, captured from the command's sender). |
+| `telegram_rating_votes` | `pollId` + `telegramUserId` (+ `telegramUserId-index` GSI) | This bot (`handle_poll_answer`) | Website's Mini App API | One row per person's current rating on a poll. The row's existence *is* the vote — a retraction or switch to "view results" **deletes** the row rather than storing a null rating. |
+| `telegram_feedback` | `pollId` + `feedbackId` | Website's Mini App (`POST /telegram/feedback`) | This bot (`notify_new_feedback`, via a DynamoDB Stream) | Detailed per-session feedback submitted through the Mini App form — this bot only reads it (to DM the GM), never writes it. |
+| `signup_requests` *(website-owned)* | `requestId` | Website backend | This bot (`notify_new_signup`, via a DynamoDB Stream) | Not one of this bot's own tables — `notifySignup` just consumes its Stream to DM the admin about new club applications. |
+
+Three SSM parameters per environment, Terraform-managed placeholders (`aws_ssm_parameter`
+with `value = "replace_me!"` and `ignore_changes` on value, so Terraform never
+overwrites what you actually set — see Setup above): `/ttrpg_club/<env>/poll_bot/token`
+(the bot token), `/ttrpg_club/<env>/telegram_admin_chat_id` (the admin's personal chat,
+for signup notifications), and `/ttrpg_club/<env>/telegram_club_chat_id` (the one group
+this bot is allowed to operate in — see Chat Restriction below). None of the three are
+in source control; the Lambda reads each by name (`*_SSM_PARAMETER` env vars) and caches
+the value for the life of the warm container.
+
+## Backfilling Historical Data
+
+If the bot was running (creating `/rate` polls) before DynamoDB tracking existed,
+`scripts/backfill_historical_polls.py` can recover that history straight from Telegram:
+it logs in as a personal account (MTProto — the Bot API has no method to read chat
+history at all) and walks the chat, matching each poll back to the `/rate` command that
+created it and fetching every voter. See the script's own docstring for the full
+`check` → `scan` → `load` workflow, safety notes (it's read/inspect-before-you-write
+throughout), and why it sometimes needs to cast a real "Подивитись відповідь" vote to
+unlock a poll's results (harmless — the live bot treats that option as "not a rating").
+
 ## Club Signup Notifications (`notifySignup`)
 
 A second function, `notifySignup`, is triggered directly by the `ttrpg_club_signup_requests`
 DynamoDB Stream from the separate `ttrpg_website2`/`aws_infra` project — it posts a message
-to `ADMIN_CHAT_ID` whenever someone submits a new club membership request. It reuses this
-bot's existing token (same SSM parameter, `Bot.send_message`), so no second bot is needed.
+to the admin's chat (fetched from `/ttrpg_club/<env>/telegram_admin_chat_id` via SSM)
+whenever someone submits a new club membership request. It reuses this bot's existing
+token (same SSM parameter, `Bot.send_message`), so no second bot is needed.
 
 The stream ARN needs no manual wiring — `aws_infra`'s Terraform for that environment's
 `signup_requests` table publishes it to SSM as `/ttrpg_club/<env>/signup_requests_stream_arn`,
@@ -203,9 +278,7 @@ deep link, which works everywhere):
    deployed site's `/telegram` page — e.g. `https://your-cloudfront-domain/telegram`.
 2. Apply with the resulting deep link:
    ```bash
-   terraform apply \
-     -var="admin_chat_id=$ADMIN_CHAT_ID" \
-     -var="mini_app_deep_link=https://t.me/your_bot/stats"
+   terraform apply -var="mini_app_deep_link=https://t.me/your_bot/stats"
    ```
 
 Until `mini_app_deep_link` is set, `/stats` replies with a "temporarily unavailable"
@@ -216,6 +289,14 @@ The Mini App also has three navigation buttons under `/stats` — **My Games Pla
 into a per-session voter breakdown. These read from the same two tables above (plus a
 `creatorUserId-index` GSI on the polls table for "conducted") via new `POST
 /telegram/games/*` endpoints on the club API — no bot changes needed for this part.
+
+A fourth button, **🏆 Leaderboard**, shows two top-10 lists — most games played, most
+games run as GM — with standard competition ranking (ties share a place; e.g. two
+people tied for 1st are both shown 🥇, the next distinct score is 3rd, never 2nd), gold/
+silver/bronze medals for the top 3, and a default filter of "this month" (with buttons
+for last month, all time, or a custom range). Backed by `POST /telegram/leaderboard`.
+One deliberate exclusion: a GM's own vote on their own session doesn't count as them
+"playing" it — only counted on the GM board, not the player board.
 
 ## Session Feedback (`?startapp=feedback_<pollId>`)
 
@@ -282,4 +363,10 @@ AWS Lambda free tier includes:
 - 1M requests/month
 - 400,000 GB-seconds of compute time/month
 
-This bot should stay within free tier for moderate usage.
+This bot should stay within free tier for moderate usage. Two small additions beyond
+Lambda itself, both negligible at this project's table sizes: point-in-time recovery on
+the prod DynamoDB tables (~$0.20/GB-month) and the error-alerting Lambda in
+`aws_infra/monitoring/ttrpg_club_prod_alerts`, which costs nothing beyond its own
+(effectively free-tier) invocations — it's a plain CloudWatch Logs subscription filter,
+deliberately not a CloudWatch Alarm + SNS setup, since alarms bill a flat monthly fee
+per alarm whether or not they ever fire.

@@ -60,3 +60,10 @@ yarn-error.log*
 config.py
 bot_token.txt
 test_bot.py
+
+# scripts/backfill_historical_polls.py — Telethon user-account session (a live login
+# credential, not a secret file that's ever meant to be shared or committed) + its
+# scan output (contains real member Telegram user IDs/names).
+scripts/*.session
+scripts/*.session-journal
+scripts/*.json
