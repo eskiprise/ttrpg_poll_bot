@@ -32,11 +32,6 @@ RATING_OPTIONS = [
     "10 / 10 🌟🌟🌟"
 ]
 
-BOOL_OPTIONS = [
-    "Так",
-    "Ні"
-]
-
 
 class User:
     def __init__(self, user: dict) -> None:
@@ -374,13 +369,30 @@ def notify_new_feedback(event, context):
 
 def handle_start_command(bot: Bot, update: Update):
     """Handle /start command."""
+    text = (
+        'Привіт! Цей бот створює опитування та збирає статистику для TTRPG клубу '
+        'Dice & Adventures.\n\n'
+        'Цей бот не призначений для використання будь-ким іншим.\n\n'
+        'Але якщо вам цікаво дізнатись більше про наш клуб — завітайте на наш сайт. '
+        'Приєднатися можна за контактами, вказаними там.\n\n'
+        'Гарного дня!'
+    )
+    website_url = os.environ.get('CLUB_WEBSITE_URL')
+    reply_markup = None
+    if website_url:
+        reply_markup = {
+            'inline_keyboard': [[
+                {'text': '🌐 Наш сайт', 'url': website_url}
+            ]]
+        }
+    else:
+        logger.warning("CLUB_WEBSITE_URL is not configured — /start sent without a website button")
+
     bot.send_message(
         update.message.chat.id,
-        'Привіт!\n'
-        '/poll <текст> або /rate <текст> - створити опитування з оцінками 1-10\n'
-        '/bool <питання> - створити опитування Так/Ні\n'
-        '/stats - переглянути свою особисту статистику оцінок',
-        message_thread_id=update.message.message_thread_id
+        text,
+        message_thread_id=update.message.message_thread_id,
+        reply_markup=reply_markup,
     )
 
 
@@ -417,13 +429,13 @@ def handle_stats_command(bot: Bot, update: Update):
 
 
 def handle_poll_command(bot: Bot, update: Update):
-    """Handle /poll and /rate commands."""
+    """Handle /rate command."""
     args = update.message.get_command_args()
-    
+
     if not args:
         bot.send_message(
             update.message.chat.id,
-            'Будь ласка, додайте текст після команди. Наприклад: /poll oblivion',
+            'Будь ласка, додайте текст після команди. Наприклад: /rate oblivion',
             message_thread_id=update.message.message_thread_id
         )
         return
@@ -497,31 +509,6 @@ def _send_feedback_link(bot: Bot, update: Update, poll_id: str):
     )
 
 
-def handle_bool_command(bot: Bot, update: Update):
-    """Handle /bool command."""
-    args = update.message.get_command_args()
-    
-    if not args:
-        bot.send_message(
-            update.message.chat.id,
-            'Будь ласка, додайте питання після команди. Наприклад: /bool Це правда?',
-            message_thread_id=update.message.message_thread_id
-        )
-        return
-
-    # Send poll with Yes/No options
-    bot.send_poll(
-        chat_id=update.message.chat.id,
-        question=args,
-        options=BOOL_OPTIONS,
-        is_anonymous=False,
-        allows_multiple_answers=False,
-        message_thread_id=update.message.message_thread_id
-    )
-    
-    logger.info(f"Bool poll created by {update.message.from_user.username}: {args}")
-
-
 def handle_poll_answer(update: Update):
     """
     Record a vote on a /rate poll (option_ids[0] == 0 is "Подивитись відповідь" —
@@ -530,7 +517,7 @@ def handle_poll_answer(update: Update):
     to "view results" clears any previously stored rating for that user — otherwise
     someone who voted an 8, then realized they hadn't actually played and retracted,
     would stay counted as a player forever. Silently ignored for polls we didn't create
-    via /rate (e.g. /bool polls) since they're never in the polls table.
+    via /rate since they're never in the polls table.
     """
     answer = update.poll_answer
     if not answer.user:
@@ -643,10 +630,8 @@ def update_handler(update: Update):
 
     if command == '/start':
         handle_start_command(bot, update)
-    elif command in ['/poll', '/rate']:
+    elif command == '/rate':
         handle_poll_command(bot, update)
-    elif command == '/bool':
-        handle_bool_command(bot, update)
     elif command == '/stats':
         handle_stats_command(bot, update)
     else:

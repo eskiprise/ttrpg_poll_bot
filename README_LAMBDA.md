@@ -88,8 +88,8 @@ curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
 
 ### Routine code changes
 
-Once the infrastructure above exists, day-to-day changes to `lambda_handler.py` don't
-need Terraform at all — either push to `develop` (updates the 3 dev functions) or
+Once the infrastructure above exists, day-to-day changes to `lambda_handler.py` don't go
+through Terraform at all — either push to `develop` (updates the 3 dev functions) or
 `main` (updates the 3 prod functions) — see GitHub Actions Deployment below — or,
 locally, for whichever stack you're updating:
 
@@ -101,13 +101,21 @@ aws lambda update-function-code --function-name telegram-poll-bot-<env>-notifySi
 aws lambda update-function-code --function-name telegram-poll-bot-<env>-notifyFeedback --zip-file fileb://function.zip
 ```
 
+This is enforced, not just a convention: all 3 modules in both environments set
+`ignore_source_code_hash = true`. Without it, any later `terraform apply` for an
+unrelated change (env vars, IAM) would notice that the function's real deployed code
+(pushed by CI) no longer matches what's in the local `build/` directory and silently
+revert it back — undoing every code deploy that happened outside Terraform since the
+last local build. With the flag set, Terraform only ever pushes code on the very first
+`apply` (when the function doesn't exist yet); every apply after that only touches
+infrastructure (env vars, IAM, memory/timeout, etc.), never the deployed code.
+
 ## Usage
 
-- `/poll <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
 - `/rate <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
-- `/bool <question>` - Create a Yes/No poll
 - `/stats` - Open the club's Telegram Mini App: your own rating stats, game history, and a leaderboard
-- `/start` - Show help
+- `/start` - A short Ukrainian description of the bot (it's for this club only) plus a
+  button linking to the club's website (`CLUB_WEBSITE_URL` — see Configuration)
 
 ## Chat Restriction
 
@@ -133,11 +141,14 @@ aws ssm put-parameter --name "/ttrpg_club/<env>/telegram_club_chat_id" \
 ## Configuration
 
 Edit `aws_infra/lambda/ttrpg_poll_bot_<env>/variables.tf` (region, `mini_app_deep_link`,
-`bot_username`) or `main.tf` (memory, timeout, environment variables) — these now live in
-Terraform, not `serverless.yml` (removed as part of the Terraform migration). The two
-chat IDs (`admin_chat_id`, `allowed_chat_id`) aren't Terraform variables — they're kept
-out of source control entirely and read from SSM at runtime (see Chat Restriction above
-and the Setup section's SSM parameters).
+`bot_username`, `club_website_url`) or `main.tf` (memory, timeout, environment variables)
+— these now live in Terraform, not `serverless.yml` (removed as part of the Terraform
+migration). `club_website_url` defaults to `""` (no default set — dev and prod point at
+different sites) and is linked from `/start`; until it's set, `/start` sends its
+description text without a website button. The two chat IDs (`admin_chat_id`,
+`allowed_chat_id`) aren't Terraform variables at all — they're kept out of source control
+entirely and read from SSM at runtime (see Chat Restriction above and the Setup section's
+SSM parameters).
 
 ## Local Development
 

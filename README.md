@@ -11,13 +11,13 @@ covers what the bot does and how to run a minimal version locally.
 
 ## Commands
 
-- `/rate <text>` or `/poll <text>` — create a non-anonymous 1–10 rating poll (e.g.
+- `/rate <text>` — create a non-anonymous 1–10 rating poll (e.g.
   `/rate Curse of Strahd session 4`), plus a "📝 Залишити фідбек" button opening the
   Mini App's private feedback form for that session.
-- `/bool <question>` — a plain Yes/No poll (not tracked in stats — just a quick vote).
 - `/stats` — opens the Mini App: your own rating history, a leaderboard, and
   Played/Conducted/All game lists.
-- `/start` — help text.
+- `/start` — a short description of the bot (Ukrainian) and a button linking to the
+  club's website (`CLUB_WEBSITE_URL`).
 
 Rating polls always have 11 options: "Подивитись відповідь" (view results, not counted
 as a rating) plus 1–10. The exact emoji per rating have changed at least once over the
