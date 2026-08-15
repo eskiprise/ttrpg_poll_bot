@@ -318,6 +318,13 @@ link that opens the Mini App straight to that session's detailed feedback form (
 deliberately separate from the quick poll vote: it's a private, mostly-anonymous channel
 for the GM, not part of the public rating/player-list bookkeeping above.
 
+**Gated on having actually voted**: the Mini App checks `POST /telegram/feedback/eligibility`
+before showing the form, and `POST /telegram/feedback` re-checks the same thing
+server-side — both look up `telegramUserId` + `pollId` in `telegram_rating_votes`.
+Someone who hasn't rated the session sees an explanatory message instead of the form
+(this bot doesn't enforce it — it's the website backend's job, see
+`../ttrpg_website2/README.md`'s Data Model).
+
 Feedback submissions are stored in a third new table, `ttrpg_club_telegram_feedback`
 (also in `aws_infra`'s Terraform). Delivery to the GM works the same way as
 `notifySignup`: a DynamoDB Stream on that table triggers this repo's `notifyFeedback`
