@@ -203,7 +203,7 @@ Actions section below, and the manual command list under "Routine code changes" 
 
 ## Data Model
 
-All tables live in `aws_infra/dynamodb/ttrpg_club/<env>` (one Terraform state, all 11
+All tables live in `aws_infra/dynamodb/ttrpg_club/<env>` (one Terraform state, all 14
 of that project's tables — see `../ttrpg_website2/README.md` for the other 8, which
 this bot never touches). Point-in-time recovery is enabled on all prod tables — see
 `aws_infra/dynamodb/ttrpg_club/prod`.
@@ -213,6 +213,9 @@ this bot never touches). Point-in-time recovery is enabled on all prod tables �
 | `telegram_rating_polls` | `pollId` (+ `creatorUserId-index` GSI) | This bot (`handle_poll_command`) | This bot, website's Mini App API | One row per `/rate` poll — question text, GM (`creatorUserId`, captured from the command's sender). |
 | `telegram_rating_votes` | `pollId` + `telegramUserId` (+ `telegramUserId-index` GSI) | This bot (`handle_poll_answer`) | Website's Mini App API | One row per person's current rating on a poll. The row's existence *is* the vote — a retraction or switch to "view results" **deletes** the row rather than storing a null rating. |
 | `telegram_feedback` | `pollId` + `feedbackId` | Website's Mini App (`POST /telegram/feedback`) | This bot (`notify_new_feedback`, via a DynamoDB Stream) | Detailed per-session feedback submitted through the Mini App form — this bot only reads it (to DM the GM), never writes it. |
+| `telegram_xp_ledger` | `telegramUserId` + `sourceId` | This bot (`_award_xp`) | This bot only | Append-only audit trail of every XP award — the sole idempotency source of truth (conditional `PutItem`), never deleted. See Gamification below. |
+| `telegram_player_level` | `telegramUserId` | This bot (`_apply_xp_to_level`) | Website's Mini App API | One row per player: current level/XP plus lifetime `gamesPlayed`/`feedbackGiven` counters. |
+| `telegram_achievements` | `telegramUserId` + `achievementId` | This bot (`_award_achievement`) | Website's Mini App API | One-time badges — a row's existence is the unlock. |
 | `signup_requests` *(website-owned)* | `requestId` | Website backend | This bot (`notify_new_signup`, via a DynamoDB Stream) | Not one of this bot's own tables — `notifySignup` just consumes its Stream to DM the admin about new club applications. |
 
 Three SSM parameters per environment, Terraform-managed placeholders (`aws_ssm_parameter`
@@ -224,6 +227,44 @@ this bot is allowed to operate in — see Chat Restriction below). None of the t
 in source control; the Lambda reads each by name (`*_SSM_PARAMETER` env vars) and caches
 the value for the life of the warm container.
 
+## Gamification (XP, Levels, Achievements)
+
+Players earn XP by voting on `/rate` polls, level up 1–10 along a fixed curve, and
+unlock one-time achievement badges — all shown in the Mini App's `/stats` page.
+**All of this is awarded exclusively by this bot**, in `lambda_handler.py` — the website
+backend only ever *reads* `telegram_player_level`/`telegram_achievements`, never writes
+them, so the leveling formula and every GM-exclusion check live in exactly one place.
+GMs (a poll's `creatorUserId`) never earn XP or achievements for their own sessions, on
+any path, even if they technically vote on their own poll.
+
+**XP sources**: a real 1–10 vote on `/rate` = 10 XP, once ever per poll (retracting and
+revoting, or just changing your rating, never re-earns it — see `_award_xp`'s
+append-only ledger). A 2nd vote-XP-earning poll in the same ISO calendar week (Mon–Sun
+UTC) = +5 XP once per week (`_maybe_award_weekly_bonus`). Submitting extended feedback
+(via `notify_new_feedback`, since that's where the GM lookup already happens) = +2 XP,
+once per poll.
+
+**Levels**: level 1→2 needs 100 XP; each next level's requirement is
+`floor(previous * 1.2 / 10) * 10` (`LEVEL_THRESHOLDS` — computed once at import time,
+not hand-transcribed). Crossing a threshold carries the XP overflow forward rather than
+resetting to zero. Level 10 is max — XP keeps accumulating uncapped past it. Titles and
+emoji per level live only in `ttrpg_website2/shared/src/gamification.ts` (this bot never
+displays them, so it only needs the numeric thresholds) — keep both files' thresholds in
+sync if either changes.
+
+**Achievements**: one-time badges, no XP — `games_played_{1,10,50,100}`,
+`feedback_given_{1,10,20,50}`, and `max_level`. Checked against lifetime `gamesPlayed`/
+`feedbackGiven` counters on `telegram_player_level` every time XP is awarded
+(`_check_and_award_tier_achievements`), idempotent the same way XP is. Titles/emoji/tier
+colors are display-only, also in `gamification.ts`.
+
+**Concurrency**: vote XP (`webhook`) and feedback XP (`notify_new_feedback`) are
+separate Lambda invocations that could race on the same player's `telegram_player_level`
+row — `_apply_xp_to_level` uses an optimistic lock (`version` attribute, 3 retries,
+logs and gives up on exhaustion) rather than a DynamoDB transaction, since the ledger
+entry itself is never lost either way and any rare drift is fixable by re-running the
+backfill script below in reconciliation mode.
+
 ## Backfilling Historical Data
 
 If the bot was running (creating `/rate` polls) before DynamoDB tracking existed,
@@ -234,6 +275,27 @@ created it and fetching every voter. See the script's own docstring for the full
 `check` → `scan` → `load` workflow, safety notes (it's read/inspect-before-you-write
 throughout), and why it sometimes needs to cast a real "Подивитись відповідь" vote to
 unlock a poll's results (harmless — the live bot treats that option as "not a rating").
+
+`scripts/backfill_gamification.py` is a separate, simpler tool: it derives
+`telegram_xp_ledger`/`telegram_player_level`/`telegram_achievements` purely from data
+**already** in DynamoDB (`telegram_rating_polls`/`telegram_rating_votes`/
+`telegram_feedback`) — no MTProto needed. Only counts votes/feedback from
+`--cutoff` onward (default 2026-01-01). Dry-run by default; pass `--apply` to write.
+Safely re-runnable at any time as a reconciliation tool (it always fully recomputes and
+overwrites `telegram_player_level`, but never duplicates a ledger/achievement row). It
+prints every poll with a missing `creatorUserId` prominently — those polls' voters can't
+be excluded as the GM, so fix them (or explicitly accept the risk) before `--apply`:
+
+```bash
+python scripts/backfill_gamification.py \
+  --rating-polls-table ttrpg_club_<env>_telegram_rating_polls \
+  --rating-votes-table ttrpg_club_<env>_telegram_rating_votes \
+  --feedback-table ttrpg_club_<env>_telegram_feedback \
+  --xp-ledger-table ttrpg_club_<env>_telegram_xp_ledger \
+  --player-level-table ttrpg_club_<env>_telegram_player_level \
+  --achievements-table ttrpg_club_<env>_telegram_achievements \
+  --region eu-west-2 [--cutoff 2026-01-01] [--apply]
+```
 
 ## Club Signup Notifications (`notifySignup`)
 
@@ -309,6 +371,9 @@ for last month, all time, or a custom range). Backed by `POST /telegram/leaderbo
 One deliberate exclusion: a GM's own vote on their own session doesn't count as them
 "playing" it — only counted on the GM board, not the player board.
 
+`/stats` also opens with a level card (title/emoji/XP progress) that taps through to a
+full achievement list — see Gamification above for how XP/levels/achievements work.
+
 ## Session Feedback (`?startapp=feedback_<pollId>`)
 
 Alongside the quick 1-10 poll, every `/rate` also sends a second message with a
@@ -318,12 +383,13 @@ link that opens the Mini App straight to that session's detailed feedback form (
 deliberately separate from the quick poll vote: it's a private, mostly-anonymous channel
 for the GM, not part of the public rating/player-list bookkeeping above.
 
-**Gated on having actually voted**: the Mini App checks `POST /telegram/feedback/eligibility`
-before showing the form, and `POST /telegram/feedback` re-checks the same thing
-server-side — both look up `telegramUserId` + `pollId` in `telegram_rating_votes`.
-Someone who hasn't rated the session sees an explanatory message instead of the form
-(this bot doesn't enforce it — it's the website backend's job, see
-`../ttrpg_website2/README.md`'s Data Model).
+**Gated on having actually voted, and only once per poll**: the Mini App checks
+`POST /telegram/feedback/eligibility` before showing the form, and `POST /telegram/feedback`
+re-checks the same two things server-side — a vote in `telegram_rating_votes` for
+`telegramUserId` + `pollId`, and no existing row in `telegram_feedback` for that same
+pair. Someone who hasn't rated the session, or already submitted feedback for it, sees an
+explanatory message instead of the form (this bot doesn't enforce it — it's the website
+backend's job, see `../ttrpg_website2/README.md`'s Data Model).
 
 Feedback submissions are stored in a third new table, `ttrpg_club_telegram_feedback`
 (also in `aws_infra`'s Terraform). Delivery to the GM works the same way as

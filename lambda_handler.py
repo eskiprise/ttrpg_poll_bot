@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 
 import boto3
 import requests
+from boto3.dynamodb.conditions import Key
 from boto3.dynamodb.types import TypeDeserializer
+from botocore.exceptions import ClientError
 
 # Setup logging
 logger = logging.getLogger()
@@ -31,6 +33,47 @@ RATING_OPTIONS = [
     "9 / 10 🤩",
     "10 / 10 🌟🌟🌟"
 ]
+
+# Gamification — XP, levels, achievements. See TelegramUserStats/gamification.ts in
+# ttrpg_website2/shared for the display-side mirror (titles, emoji, the ACHIEVEMENTS
+# catalog) — this file only ever needs the numeric thresholds, since it's the only place
+# XP/achievements actually get awarded; keep LEVEL_THRESHOLDS and the two achievement
+# threshold lists below in sync with that file if either changes.
+XP_VOTE = 10
+XP_WEEKLY_BONUS = 5
+XP_FEEDBACK_BONUS = 2
+WEEKLY_BONUS_VOTES_REQUIRED = 2
+
+LEVEL_UP_BASE_XP = 100
+LEVEL_UP_MULTIPLIER = 1.2
+MAX_PLAYER_LEVEL = 10
+
+GAMES_PLAYED_ACHIEVEMENT_THRESHOLDS = [1, 10, 50, 100]
+FEEDBACK_GIVEN_ACHIEVEMENT_THRESHOLDS = [1, 10, 20, 50]
+
+
+def _compute_level_thresholds() -> list:
+    """XP needed for level N -> N+1; index 0 = 1->2 ... index 8 = 9->10."""
+    thresholds = [LEVEL_UP_BASE_XP]
+    while len(thresholds) < MAX_PLAYER_LEVEL - 1:
+        thresholds.append(int((thresholds[-1] * LEVEL_UP_MULTIPLIER) // 10) * 10)
+    return thresholds
+
+
+LEVEL_THRESHOLDS = _compute_level_thresholds()
+
+
+def apply_xp(level: int, current_xp: int, gained_xp: int) -> tuple:
+    """Applies gained XP, leveling up (possibly more than once) with overflow carried
+    forward. Uncapped past MAX_PLAYER_LEVEL — no further leveling, XP just accumulates."""
+    xp = current_xp + gained_xp
+    while level < MAX_PLAYER_LEVEL:
+        threshold = LEVEL_THRESHOLDS[level - 1]
+        if xp < threshold:
+            break
+        xp -= threshold
+        level += 1
+    return level, xp
 
 
 class User:
@@ -240,8 +283,145 @@ def _rating_votes_table():
     return _dynamodb.Table(os.environ['TELEGRAM_RATING_VOTES_TABLE'])
 
 
+def _xp_ledger_table():
+    return _dynamodb.Table(os.environ['TELEGRAM_XP_LEDGER_TABLE'])
+
+
+def _player_level_table():
+    return _dynamodb.Table(os.environ['TELEGRAM_PLAYER_LEVEL_TABLE'])
+
+
+def _achievements_table():
+    return _dynamodb.Table(os.environ['TELEGRAM_ACHIEVEMENTS_TABLE'])
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_week_key(iso_timestamp: str) -> str:
+    year, week, _ = datetime.fromisoformat(iso_timestamp).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _award_xp(telegram_user_id: int, source_id: str, xp: int, xp_type: str, counter_field: str = None) -> bool:
+    """Idempotently award XP once per source_id. Conditional put on the append-only
+    ledger is the sole source of truth for "was this already awarded" — so this
+    correctly no-ops on retract+revote, a rating value change, or a duplicate webhook
+    delivery, regardless of what happens to the mutable votes table. Returns True only
+    when this call newly awarded XP (used to gate the weekly-bonus check on a real vote,
+    not a harmless re-delivery)."""
+    try:
+        _xp_ledger_table().put_item(
+            Item={
+                'telegramUserId': telegram_user_id,
+                'sourceId': source_id,
+                'xp': xp,
+                'type': xp_type,
+                'awardedAt': _now_iso(),
+            },
+            ConditionExpression='attribute_not_exists(sourceId)',
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            return False
+        raise
+    _apply_xp_to_level(telegram_user_id, xp, counter_field)
+    return True
+
+
+def _apply_xp_to_level(telegram_user_id: int, gained_xp: int, counter_field: str = None) -> None:
+    """Read-modify-write telegram_player_level with an optimistic lock (version) — needed
+    because vote XP (webhook) and feedback XP (notify_new_feedback) are separate Lambda
+    invocations that could race on the same user's row. Up to 3 attempts; on exhaustion,
+    logs and gives up — the ledger entry itself is never lost, so any rare drift here is
+    fixable later by re-running scripts/backfill_gamification.py in reconciliation mode."""
+    table = _player_level_table()
+    new_level = old_level = None
+    games_played = feedback_given = 0
+
+    for attempt in range(3):
+        item = table.get_item(Key={'telegramUserId': telegram_user_id}).get('Item') or {}
+        old_level = int(item.get('level', 1))
+        current_xp = int(item.get('currentXp', 0))
+        total_xp = int(item.get('totalXp', 0)) + gained_xp
+        games_played = int(item.get('gamesPlayed', 0)) + (1 if counter_field == 'gamesPlayed' else 0)
+        feedback_given = int(item.get('feedbackGiven', 0)) + (1 if counter_field == 'feedbackGiven' else 0)
+        version = int(item.get('version', 0))
+
+        new_level, new_current_xp = apply_xp(old_level, current_xp, gained_xp)
+
+        try:
+            table.put_item(
+                Item={
+                    'telegramUserId': telegram_user_id,
+                    'level': new_level,
+                    'currentXp': new_current_xp,
+                    'totalXp': total_xp,
+                    'gamesPlayed': games_played,
+                    'feedbackGiven': feedback_given,
+                    'updatedAt': _now_iso(),
+                    'version': version + 1,
+                },
+                ConditionExpression='attribute_not_exists(version) OR version = :expected',
+                ExpressionAttributeValues={':expected': version},
+            )
+            break
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                raise
+            if attempt == 2:
+                logger.error(
+                    f"Gave up updating telegram_player_level for user {telegram_user_id} "
+                    "after 3 attempts (concurrent update)"
+                )
+                return
+
+    if counter_field == 'gamesPlayed':
+        _check_and_award_tier_achievements(telegram_user_id, 'games_played', games_played, GAMES_PLAYED_ACHIEVEMENT_THRESHOLDS)
+    elif counter_field == 'feedbackGiven':
+        _check_and_award_tier_achievements(telegram_user_id, 'feedback_given', feedback_given, FEEDBACK_GIVEN_ACHIEVEMENT_THRESHOLDS)
+
+    if new_level >= MAX_PLAYER_LEVEL > old_level:
+        _award_achievement(telegram_user_id, 'max_level')
+
+
+def _check_and_award_tier_achievements(telegram_user_id: int, id_prefix: str, value: int, thresholds: list) -> None:
+    """Idempotent via the achievements table's own conditional put — safe to re-check
+    already-crossed thresholds on every subsequent vote/feedback."""
+    for threshold in thresholds:
+        if value >= threshold:
+            _award_achievement(telegram_user_id, f'{id_prefix}_{threshold}')
+
+
+def _award_achievement(telegram_user_id: int, achievement_id: str) -> None:
+    try:
+        _achievements_table().put_item(
+            Item={
+                'telegramUserId': telegram_user_id,
+                'achievementId': achievement_id,
+                'unlockedAt': _now_iso(),
+            },
+            ConditionExpression='attribute_not_exists(achievementId)',
+        )
+        logger.info(f"Awarded achievement {achievement_id} to user {telegram_user_id}")
+    except ClientError as e:
+        if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+            raise
+
+
+def _maybe_award_weekly_bonus(telegram_user_id: int) -> None:
+    """Awarded once per ISO calendar week (Mon-Sun UTC) on a user's 2nd vote-XP-earning
+    poll that week — counts ledger 'vote' entries by their real awardedAt, not "now", so
+    this stays correct however late a batch of webhook updates gets processed."""
+    week_key = _iso_week_key(_now_iso())
+    result = _xp_ledger_table().query(KeyConditionExpression=Key('telegramUserId').eq(telegram_user_id))
+    votes_this_week = sum(
+        1 for item in result.get('Items', [])
+        if item.get('type') == 'vote' and _iso_week_key(item.get('awardedAt', '')) == week_key
+    )
+    if votes_this_week >= WEEKLY_BONUS_VOTES_REQUIRED:
+        _award_xp(telegram_user_id, f"weekly_bonus#{week_key}", XP_WEEKLY_BONUS, 'weekly_bonus')
 
 
 _deserializer = TypeDeserializer()
@@ -350,6 +530,22 @@ def notify_new_feedback(event, context):
         if not gm_user_id:
             logger.warning(f"Poll {poll_id} has no recorded creatorUserId — cannot DM the GM")
             continue
+
+        # Isolated from the DM-send below: an XP failure must not affect the GM
+        # notification, and vice versa — a raised exception here would otherwise abort
+        # the DM too and cause the whole batch to be retried by the stream's
+        # event-source-mapping (redelivering DMs that already succeeded).
+        if feedback.get('telegramUserId') != gm_user_id:
+            try:
+                _award_xp(
+                    int(feedback['telegramUserId']),
+                    f"feedback_bonus#{poll_id}",
+                    XP_FEEDBACK_BONUS,
+                    'feedback_bonus',
+                    counter_field='feedbackGiven',
+                )
+            except Exception as e:
+                logger.error(f"Failed to award feedback XP for poll {poll_id}: {e}")
 
         text = f"{poll.get('questionText', '')}\n\n{_feedback_message_text(feedback)}"
         try:
@@ -557,6 +753,10 @@ def handle_poll_answer(update: Update):
         'answeredAt': _now_iso(),
     })
     logger.info(f"Recorded rating {rating} from user {answer.user.id} for poll {answer.poll_id}")
+
+    if answer.user.id != poll.get('creatorUserId'):
+        if _award_xp(answer.user.id, f"vote#{answer.poll_id}", XP_VOTE, 'vote', counter_field='gamesPlayed'):
+            _maybe_award_weekly_bonus(answer.user.id)
 
 
 GROUP_CHAT_TYPES = ('group', 'supergroup')
