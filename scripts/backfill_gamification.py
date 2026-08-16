@@ -22,6 +22,12 @@ confirm who the GM was, so there's no safe way to award XP to anyone on that pol
 script prints every excluded poll prominently; fix creatorUserId in telegram_rating_polls
 and re-run to bring a poll's real players' XP/achievements in.
 
+Same treatment for --allowed-chat-id: any poll whose stored chatId doesn't match it
+(e.g. a poll created in a DM with the bot, before lambda_handler.py started rejecting
+/rate outside the configured chat) is excluded entirely too — these are phantom polls
+that should never have counted at all. Consider running cleanup_wrong_chat_polls.py to
+delete them outright instead of just excluding them here on every run.
+
 Dry-run by default — prints a full summary, writes nothing. Pass --apply to actually
 write. Safe to re-run at any time as a reconciliation tool: ledger/achievement rows are
 only ever added, never duplicated (skipped if already present, preserving their original
@@ -38,6 +44,7 @@ Usage:
         --xp-ledger-table ttrpg_club_dev_telegram_xp_ledger \
         --player-level-table ttrpg_club_dev_telegram_player_level \
         --achievements-table ttrpg_club_dev_telegram_achievements \
+        --allowed-chat-id -1002578567898 \
         --region eu-west-2 [--cutoff 2026-01-01] [--apply]
 """
 from __future__ import annotations
@@ -121,6 +128,8 @@ def run(args) -> None:
     print(f"Scanning {args.rating_polls_table} ...")
     polls = _scan_table(polls_table)
     creator_by_poll = {p.get("pollId"): p.get("creatorUserId") for p in polls}
+    chat_by_poll = {p.get("pollId"): p.get("chatId") for p in polls}
+
     missing_creator_polls = [poll_id for poll_id, creator in creator_by_poll.items() if creator is None]
     if missing_creator_polls:
         print(
@@ -137,31 +146,55 @@ def run(args) -> None:
             "for them.\n"
         )
 
+    wrong_chat_polls = [
+        poll_id
+        for poll_id, chat_id in chat_by_poll.items()
+        if chat_id is None or int(chat_id) != args.allowed_chat_id
+    ]
+    if wrong_chat_polls:
+        print(
+            f"\n⚠ {len(wrong_chat_polls)} poll(s) were created outside the configured "
+            f"club chat (chatId != {args.allowed_chat_id}, e.g. a DM with the bot) — "
+            "excluded from this backfill entirely:"
+        )
+        for poll_id in wrong_chat_polls:
+            print(f"    {poll_id} (chatId={chat_by_poll.get(poll_id)})")
+        print(
+            "These are phantom polls that should never have counted — consider running "
+            "cleanup_wrong_chat_polls.py to delete them outright rather than just "
+            "excluding them here.\n"
+        )
+
     print(f"Scanning {args.rating_votes_table} ...")
     votes = _scan_table(votes_table)
     print(f"Scanning {args.feedback_table} ...")
     feedback_items = _scan_table(feedback_table)
 
-    def _known_gm_poll(poll_id) -> bool:
-        # Also excludes votes/feedback referencing a pollId that isn't in the polls
-        # table at all — same reasoning: no way to confirm who the GM was.
-        return poll_id in creator_by_poll and creator_by_poll[poll_id] is not None
+    def _qualifying_poll(poll_id) -> bool:
+        # Excludes votes/feedback referencing a pollId that isn't in the polls table at
+        # all too — same reasoning as a missing creatorUserId: nothing to trust here.
+        return (
+            poll_id in creator_by_poll
+            and creator_by_poll[poll_id] is not None
+            and chat_by_poll.get(poll_id) is not None
+            and int(chat_by_poll[poll_id]) == args.allowed_chat_id
+        )
 
     qualifying_votes = [
         v
         for v in votes
         if v.get("answeredAt", "") >= cutoff
-        and _known_gm_poll(v.get("pollId"))
+        and _qualifying_poll(v.get("pollId"))
         and v.get("telegramUserId") != creator_by_poll.get(v.get("pollId"))
     ]
     qualifying_feedback = [
         f
         for f in feedback_items
         if f.get("submittedAt", "") >= cutoff
-        and _known_gm_poll(f.get("pollId"))
+        and _qualifying_poll(f.get("pollId"))
         and f.get("telegramUserId") != creator_by_poll.get(f.get("pollId"))
     ]
-    print(f"{len(qualifying_votes)} / {len(votes)} votes qualify (>= {cutoff}, excluding the poll's GM, excluding unknown-GM polls)")
+    print(f"{len(qualifying_votes)} / {len(votes)} votes qualify (>= {cutoff}, excluding the poll's GM, excluding unknown-GM/wrong-chat polls)")
     print(f"{len(qualifying_feedback)} / {len(feedback_items)} feedback submissions qualify")
 
     # Candidate ledger entries: {(telegramUserId, sourceId): {xp, type, awardedAt}}
@@ -306,6 +339,13 @@ def main():
     parser.add_argument("--xp-ledger-table", required=True)
     parser.add_argument("--player-level-table", required=True)
     parser.add_argument("--achievements-table", required=True)
+    parser.add_argument(
+        "--allowed-chat-id",
+        required=True,
+        type=int,
+        help="Only polls created in this chat count — the same value as this environment's "
+        "/ttrpg_club/<env>/telegram_club_chat_id SSM parameter",
+    )
     parser.add_argument("--region", default="eu-west-2")
     parser.add_argument("--cutoff", default="2026-01-01", help="YYYY-MM-DD, inclusive (default: 2026-01-01)")
     parser.add_argument("--apply", action="store_true", help="Actually write (default is dry-run)")
