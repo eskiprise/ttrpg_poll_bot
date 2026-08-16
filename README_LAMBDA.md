@@ -131,6 +131,14 @@ uses the `my_chat_member` webhook update (Telegram's default `allowed_updates` a
 includes it, no webhook re-registration needed); note this same update type also fires
 for private chats on block/unblock, which is why the handler gates on `chat.type` first.
 
+**`/rate` has its own, stricter gate on top of this** (`update_handler`, right before
+dispatching to `handle_poll_command`): it's blocked in *any* chat other than the
+configured one, including a private DM — unlike the group-only restriction above, which
+deliberately allows DMs through (that's the whole point of pointing people there). A
+poll created in a DM would otherwise pollute every stat/leaderboard/XP calculation that
+reads `telegram_rating_polls` trusting its `chatId`, since none of those re-check it at
+read time. `/start` and `/stats` are unaffected — they're meant to work from a DM.
+
 Set the real value once, per environment (Terraform creates the parameter as a
 `replace_me!` placeholder and ignores changes to its value):
 ```bash
@@ -282,13 +290,18 @@ unlock a poll's results (harmless — the live bot treats that option as "not a 
 `telegram_feedback`) — no MTProto needed. Only counts votes/feedback from
 `--cutoff` onward (default 2026-01-01). Dry-run by default; pass `--apply` to write.
 Safely re-runnable at any time as a reconciliation tool (it always fully recomputes and
-overwrites `telegram_player_level`, but never duplicates a ledger/achievement row). Any
-poll with a missing `creatorUserId` — the GM can't be identified — is excluded from the
-backfill **entirely**: every vote and feedback submission on it, for every player, not
-just a would-be GM's own, since there's no safe way to award XP to anyone on a poll with
-an unknown GM. These polls are printed prominently before the summary; fix
-`creatorUserId` in `telegram_rating_polls` and re-run to bring a poll's real players'
-XP/achievements in:
+overwrites `telegram_player_level`, but never duplicates a ledger/achievement row). Two
+things get excluded from the backfill **entirely** (every vote and feedback submission,
+for every player, not just a would-be GM's own), both printed prominently before the
+summary:
+- A poll with a missing `creatorUserId` — the GM can't be identified, so there's no safe
+  way to award anyone XP for it. Fix `creatorUserId` in `telegram_rating_polls` and
+  re-run to bring it in.
+- A poll whose stored `chatId` doesn't match `--allowed-chat-id` — most commonly a poll
+  created in a DM with the bot, from before the `/rate` gate (see Chat Restriction
+  above) started rejecting that at the source. These are phantom polls that should never
+  have counted; see `cleanup_wrong_chat_polls.py` below to delete them outright instead
+  of just excluding them here on every run.
 
 ```bash
 python scripts/backfill_gamification.py \
@@ -298,7 +311,30 @@ python scripts/backfill_gamification.py \
   --xp-ledger-table ttrpg_club_<env>_telegram_xp_ledger \
   --player-level-table ttrpg_club_<env>_telegram_player_level \
   --achievements-table ttrpg_club_<env>_telegram_achievements \
+  --allowed-chat-id <numeric_chat_id> \
   --region eu-west-2 [--cutoff 2026-01-01] [--apply]
+```
+
+`scripts/cleanup_wrong_chat_polls.py` deletes those phantom polls (and their votes,
+feedback, and any XP ledger entries) outright, rather than just excluding them from
+future backfills — this is what actually stops them showing up in the website's stats/
+leaderboard/games lists, since those endpoints trust `telegram_rating_polls` completely
+and don't re-check `chatId` at read time. Dry-run by default; pass `--apply` to delete.
+After running it with `--apply`, wipe `telegram_player_level`/`telegram_achievements`
+(they aren't touched by this script) and re-run `backfill_gamification.py --apply` to
+reconcile XP/levels/achievements — a phantom vote could have contributed to a weekly
+bonus that this script can't surgically un-award on its own (a `weekly_bonus` ledger
+entry doesn't reference a specific `pollId`), so a full recompute is the safe way to
+correct that:
+
+```bash
+python scripts/cleanup_wrong_chat_polls.py \
+  --rating-polls-table ttrpg_club_<env>_telegram_rating_polls \
+  --rating-votes-table ttrpg_club_<env>_telegram_rating_votes \
+  --feedback-table ttrpg_club_<env>_telegram_feedback \
+  --xp-ledger-table ttrpg_club_<env>_telegram_xp_ledger \
+  --allowed-chat-id <numeric_chat_id> \
+  --region eu-west-2 [--apply]
 ```
 
 ## Club Signup Notifications (`notifySignup`)

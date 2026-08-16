@@ -831,7 +831,20 @@ def update_handler(update: Update):
     if command == '/start':
         handle_start_command(bot, update)
     elif command == '/rate':
-        handle_poll_command(bot, update)
+        # /start and /stats are fine from a DM (that's the whole point of the chat
+        # restriction above pointing people there) — but a poll created outside the
+        # club's own chat would pollute every stat/leaderboard/XP calculation that reads
+        # telegram_rating_polls, since those all trust chatId without re-checking it.
+        # This is a narrower, unconditional check (unlike the group-only gate above) —
+        # it also blocks poll creation in a DM, which that gate deliberately allows.
+        if chat.id != _allowed_chat_id():
+            bot.send_message(
+                chat.id,
+                'Цю команду можна використовувати лише в чаті клубу.',
+                message_thread_id=update.message.message_thread_id
+            )
+        else:
+            handle_poll_command(bot, update)
     elif command == '/stats':
         handle_stats_command(bot, update)
     else:
