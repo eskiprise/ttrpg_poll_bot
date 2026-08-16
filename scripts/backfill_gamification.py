@@ -14,11 +14,13 @@ toward XP AND the gamesPlayed/feedbackGiven achievement counters — one consist
 historical scan for the whole feature, even though the live bot's achievement counters
 are NOT cutoff-limited (see the design plan for why this script intentionally differs).
 
-GM exclusion is a hard requirement, not a "close enough" one: this script prints every
-poll with a missing/null creatorUserId prominently, since backfill_historical_polls.py
-can leave that null for polls it couldn't attribute — such a poll's voters can't be
-excluded as the GM and may incorrectly earn XP/achievements. Fix these (or explicitly
-accept the risk) before running with --apply.
+GM exclusion is a hard requirement, not a "close enough" one: any poll with a missing or
+null creatorUserId — backfill_historical_polls.py can leave that null for polls it
+couldn't attribute — is excluded from this backfill ENTIRELY (every vote and feedback
+submission on it, for every player, not just a would-be GM's own). There's no way to
+confirm who the GM was, so there's no safe way to award XP to anyone on that poll. This
+script prints every excluded poll prominently; fix creatorUserId in telegram_rating_polls
+and re-run to bring a poll's real players' XP/achievements in.
 
 Dry-run by default — prints a full summary, writes nothing. Pass --apply to actually
 write. Safe to re-run at any time as a reconciliation tool: ledger/achievement rows are
@@ -123,28 +125,43 @@ def run(args) -> None:
     if missing_creator_polls:
         print(
             f"\n⚠ {len(missing_creator_polls)} poll(s) have no recorded creatorUserId — "
-            "their voters CANNOT be excluded as the GM and may incorrectly earn XP/achievements:"
+            "the GM can't be identified, so ALL votes/feedback on these polls are "
+            "excluded from this backfill entirely (no XP, no achievement credit) until "
+            "fixed:"
         )
         for poll_id in missing_creator_polls:
             print(f"    {poll_id}")
-        print("Fix these in telegram_rating_polls (or accept the risk) before running with --apply.\n")
+        print(
+            "Fix these in telegram_rating_polls and re-run to include them — real "
+            "players on these sessions are currently missing out on XP/achievements "
+            "for them.\n"
+        )
 
     print(f"Scanning {args.rating_votes_table} ...")
     votes = _scan_table(votes_table)
     print(f"Scanning {args.feedback_table} ...")
     feedback_items = _scan_table(feedback_table)
 
+    def _known_gm_poll(poll_id) -> bool:
+        # Also excludes votes/feedback referencing a pollId that isn't in the polls
+        # table at all — same reasoning: no way to confirm who the GM was.
+        return poll_id in creator_by_poll and creator_by_poll[poll_id] is not None
+
     qualifying_votes = [
         v
         for v in votes
-        if v.get("answeredAt", "") >= cutoff and v.get("telegramUserId") != creator_by_poll.get(v.get("pollId"))
+        if v.get("answeredAt", "") >= cutoff
+        and _known_gm_poll(v.get("pollId"))
+        and v.get("telegramUserId") != creator_by_poll.get(v.get("pollId"))
     ]
     qualifying_feedback = [
         f
         for f in feedback_items
-        if f.get("submittedAt", "") >= cutoff and f.get("telegramUserId") != creator_by_poll.get(f.get("pollId"))
+        if f.get("submittedAt", "") >= cutoff
+        and _known_gm_poll(f.get("pollId"))
+        and f.get("telegramUserId") != creator_by_poll.get(f.get("pollId"))
     ]
-    print(f"{len(qualifying_votes)} / {len(votes)} votes qualify (>= {cutoff}, excluding the poll's GM)")
+    print(f"{len(qualifying_votes)} / {len(votes)} votes qualify (>= {cutoff}, excluding the poll's GM, excluding unknown-GM polls)")
     print(f"{len(qualifying_feedback)} / {len(feedback_items)} feedback submissions qualify")
 
     # Candidate ledger entries: {(telegramUserId, sourceId): {xp, type, awardedAt}}
