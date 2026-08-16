@@ -282,9 +282,13 @@ unlock a poll's results (harmless — the live bot treats that option as "not a 
 `telegram_feedback`) — no MTProto needed. Only counts votes/feedback from
 `--cutoff` onward (default 2026-01-01). Dry-run by default; pass `--apply` to write.
 Safely re-runnable at any time as a reconciliation tool (it always fully recomputes and
-overwrites `telegram_player_level`, but never duplicates a ledger/achievement row). It
-prints every poll with a missing `creatorUserId` prominently — those polls' voters can't
-be excluded as the GM, so fix them (or explicitly accept the risk) before `--apply`:
+overwrites `telegram_player_level`, but never duplicates a ledger/achievement row). Any
+poll with a missing `creatorUserId` — the GM can't be identified — is excluded from the
+backfill **entirely**: every vote and feedback submission on it, for every player, not
+just a would-be GM's own, since there's no safe way to award XP to anyone on a poll with
+an unknown GM. These polls are printed prominently before the summary; fix
+`creatorUserId` in `telegram_rating_polls` and re-run to bring a poll's real players'
+XP/achievements in:
 
 ```bash
 python scripts/backfill_gamification.py \
