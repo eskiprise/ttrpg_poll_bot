@@ -455,15 +455,16 @@ def notify_new_signup(event, context):
         if request.get('status') != 'PENDING':
             continue
 
-        text = (
-            "🆕 New club signup request\n"
-            f"Name: {request.get('firstName', '')} {request.get('lastName', '')}\n"
-            f"Email: {request.get('email', '')}\n"
-            f"Contact: {request.get('telegramOrViberContact', '')}\n\n"
-            "Review it in the admin panel to approve or reject."
-        )
+        # Only firstName is always present (plus at least one of contact/phone) — list
+        # just the fields that were actually given.
+        name = " ".join(filter(None, [request.get('firstName'), request.get('lastName')]))
+        lines = ["🆕 New club signup request", f"Name: {name}"]
+        for label, key in (("Contact", 'telegramOrViberContact'), ("Phone", 'phone'), ("Email", 'email')):
+            if request.get(key):
+                lines.append(f"{label}: {request[key]}")
+        text = "\n".join(lines) + "\n\nReview it in the admin panel to approve or reject."
         bot.send_message(chat_id=admin_chat_id, text=text)
-        logger.info(f"Notified admin about signup request from {request.get('email')}")
+        logger.info(f"Notified admin about signup request {request.get('requestId')}")
 
     return {'statusCode': 200, 'body': json.dumps({'status': 'ok'})}
 
